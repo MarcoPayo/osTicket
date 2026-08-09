@@ -233,10 +233,10 @@ if ($form && count($langs) > 1) { ?>
                     value="<?php echo $f->get('sort'); ?>"/>
             </td>
         </tr>
-    <tr>
     <?php
     }
     for ($i=0; $i<$newcount; $i++) { ?>
+        <tr>
             <td align="center"><em>+</em>
                 <input type="hidden" name="sort-new-<?php echo $i; ?>"
                     value="<?php echo $info["sort-new-$i"]; ?>"/></td>
@@ -264,16 +264,16 @@ if ($form && count($langs) > 1) { ?>
     <option value="<?php echo $m; ?>" <?php if ($rmode == $m)
          echo 'selected="selected"'; ?>><?php echo $I['desc']; ?></option>
 <?php } ?>
-                <select>
-                    <td><input type="text" size="20" name="name-new-<?php echo $i; ?>"
-                        value="<?php echo $info["name-new-$i"]; ?>"/>
-                        <font class="error"><?php
-                            if ($errors["new-$i"]['name']) echo '<br/>'; echo $errors["new-$i"]['name'];
-                            ?>
-                        </font>
-                    </td>
-                </select>
             </select>
+        </td>
+        <td><input type="text" size="20" name="name-new-<?php echo $i; ?>"
+                value="<?php echo $info["name-new-$i"]; ?>"/>
+            <font class="error"><?php
+                if ($errors["new-$i"]['name']) echo '<br/>'; echo $errors["new-$i"]['name'];
+                ?>
+            </font>
+        </td>
+        <td></td>
         </tr>
     <?php } ?>
     </tbody>
