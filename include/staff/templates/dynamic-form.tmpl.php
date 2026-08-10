@@ -54,7 +54,26 @@ if (isset($options['entry']) && $options['mode'] == 'edit') { ?>
             // Not connected to a DynamicFormField
         }
         ?>
-        <tr><?php if ($field->isBlockLevel()) { ?>
+        <tr <?php
+            // A conditional field is toggled by slideDown/slideUp against
+            // #field<widget id>, and nested rules propagate by listening for
+            // show/hide on that same element. Neither exists in this template
+            // unless the row carries the id, so without this a visibility
+            // constraint silently does nothing here.
+            //
+            // The class applies the server-side initial state, so a field
+            // which starts hidden is not visible before the script runs --
+            // the emitted script only binds handlers, it does not evaluate
+            // the condition on load.
+            try {
+                $w = $field->getWidget();
+                printf('id="field%s"%s', $w->id,
+                    $field->isVisible() ? '' : ' class="hidden"');
+            }
+            catch (Exception $e) {
+                // Field type declares no widget; nothing to toggle
+            }
+        ?>><?php if ($field->isBlockLevel()) { ?>
                 <td colspan="2">
                 <?php
             }

@@ -6,7 +6,10 @@
 <ul class="tabs" id="fieldtabs">
     <li class="active"><a href="#config"><i class="icon-cogs"></i> <?php echo __('Field Setup'); ?></a></li>
     <li><a href="#visibility"><i class="icon-beaker"></i> <?php echo __('Settings'); ?></a></li>
+    <li><a href="#conditions"><i class="icon-random"></i> <?php echo __('Conditions'); ?></a></li>
 </ul>
+
+<?php include STAFFINC_DIR . 'templates/dynamic-field-conditions.tmpl.php'; ?>
 
 <div class="hidden tab_content" id="visibility">
     <div>

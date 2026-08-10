@@ -1341,8 +1341,11 @@ class Task extends TaskModel implements RestrictedAccess, Threadable {
         // Update dynamic meta-data
         $changes = array();
         foreach ($forms as $f) {
-            $changes += $f->getChanges();
-            $f->save();
+            // 'edit' clears answers this submission made inapplicable. The
+            // clearing is reported by ::getChanges() and reaches the thread
+            // through the logEvent() below, so the old value is recoverable.
+            $changes += $f->getChanges('edit');
+            $f->save(false, 'edit');
         }
 
 

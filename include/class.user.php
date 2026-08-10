@@ -348,7 +348,13 @@ implements TemplateVariable, Searchable {
         $entry = $form->instanciate($sort, $data);
         $entry->set('object_type', 'U');
         $entry->set('object_id', $this->getId());
-        $entry->save();
+        // 'create' drops answers for conditionally hidden fields, which the
+        // browser submits regardless of the rule. Only creation is opted in
+        // for users: unlike tickets and tasks there is no event log for
+        // custom field values, so clearing one on an edit would leave no
+        // record of what it held. A call which passes no data has no source
+        // and is left alone by ::getDiscardableAnswers().
+        $entry->save(false, 'create');
         return $entry;
     }
 

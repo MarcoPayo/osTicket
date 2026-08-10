@@ -28,6 +28,13 @@
     float: right;
 }
 
+/* Initial state for a conditionally visible field. The staff stylesheet
+   carries the same rule; this one is needed for the client portal, where
+   the toggle is applied to a form row before the script binds to it. */
+.hidden {
+    display: none;
+}
+
 .non-local-image {
     display: inline-block;
     border: 3px dashed #eee;

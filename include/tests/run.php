@@ -27,6 +27,15 @@ error_reporting(E_ALL);
 
 require_once __DIR__.'/harness.php';
 
+// A few include/ units stand alone and are used by the code under test.
+// Prefer loading the real thing over stubbing it.
+require_once dirname(__DIR__).'/class.json.php';
+
+// Shared fixtures, loaded up front so no test depends on the order in which
+// the others happen to be discovered.
+foreach (glob(__DIR__.'/stubs.*.php') as $stubs)
+    require_once $stubs;
+
 $selected = isset($argv[1]) ? $argv[1] : false;
 
 $scripts = glob(__DIR__.'/test.*.php');

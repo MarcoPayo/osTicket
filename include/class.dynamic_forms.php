@@ -615,6 +615,9 @@ class DynamicFormField extends VerySimpleModel {
 
     var $_field;
     var $_disabled = false;
+    // Problems with a submitted visibility rule. These do not belong to any
+    // field of the configuration form, so they cannot travel in its errors.
+    var $_visibilityErrors = array();
 
     const FLAG_ENABLED          = 0x00001;
     const FLAG_EXT_STORED       = 0x00002; // Value stored outside of form_entry_value
@@ -662,9 +665,33 @@ class DynamicFormField extends VerySimpleModel {
         $ht['required'] = ($thisstaff) ? $this->isRequiredForStaff()
             : $this->isRequiredForUsers();
 
+        // Conditional visibility, when one has been configured. Everything
+        // which acts on a constraint -- rendering the toggle script,
+        // skipping validation while hidden, omitting the field from form
+        // state -- already keys off $ht['visibility'] on the base FormField,
+        // so attaching it here is all that is required to activate it.
+        if ($visibility = $this->getVisibilityConstraint())
+            $ht['visibility'] = $visibility;
+
         if (!isset($this->_field))
             $this->_field = new FormField($ht);
         return $this->_field;
+    }
+
+    /**
+     * Conditional visibility configured for this field, or null when none
+     * is set.
+     *
+     * Reads the configuration blob directly instead of going through
+     * ::getConfiguration(). That method lives on FormField and is reached by
+     * way of ::__call(), which would call ::getField() -- the caller of this
+     * method -- straight back.
+     */
+    function getVisibilityConstraint() {
+        if (!($definition = $this->getVisibilityDefinition()))
+            return null;
+
+        return new FieldVisibilityConstraint($definition);
     }
 
     function getForm() { return $this->form; }
@@ -702,10 +729,185 @@ class DynamicFormField extends VerySimpleModel {
 
         // See if field impl. need to save or override anything
         $config = $this->getImpl()->to_config($config);
+
+        // Conditional visibility is not a per-type configuration option, so
+        // it rides alongside them rather than coming through
+        // ::getConfigurationForm(). A request carrying no definition leaves
+        // any stored rule alone, so saving an unrelated tab of the field
+        // configuration dialog does not silently discard it; a request
+        // carrying an empty one clears it.
+        if (isset($vars['visibility'])) {
+            if ($visibility = $this->parseVisibility($vars['visibility'])) {
+                // Reject a rule which would make the form's dependencies
+                // circular. ::isVisible() survives one, but the rule could
+                // not mean what its author intended, so refuse it here
+                // rather than store something that quietly misbehaves.
+                if ($cycle = $this->findVisibilityCycle($visibility)) {
+                    $this->_visibilityErrors[] = sprintf(
+                        __('This condition would be circular: %s already depends on this field, directly or indirectly.'),
+                        $cycle->get('label') ?: $cycle->get('name'));
+                    return false;
+                }
+                $config['visibility'] = $visibility;
+            }
+        }
+        elseif ($visibility = $this->getVisibilityDefinition())
+            $config['visibility'] = $visibility;
+
         $this->set('configuration', JsonDataEncoder::encode($config));
         $this->set('hint', Format::sanitize($vars['hint']) ?: NULL);
 
         return true;
+    }
+
+    /**
+     * Normalise a submitted visibility definition. The format itself is
+     * owned by FieldVisibilityConstraint; this only supplies the id of the
+     * field being configured, so a rule cannot reference itself.
+     */
+    function parseVisibility($input) {
+        return FieldVisibilityConstraint::normalize($input, $this->getId());
+    }
+
+    /**
+     * Would storing $definition on this field make the form's visibility
+     * rules circular?
+     *
+     * A rule is evaluated by asking the fields it tests whether they are
+     * themselves visible, so A depending on B while B depends on A never
+     * terminates. ::isVisible() breaks such a loop at runtime, but a cycle
+     * still means at least one rule cannot mean what its author intended,
+     * so it is rejected at the point it would be created.
+     *
+     * Any cycle reachable from this field counts, not only one which closes
+     * back on it: reaching a loop anywhere downstream is enough to make this
+     * field's own rule unevaluable.
+     *
+     * Returns the DynamicFormField which closes the loop, or null.
+     */
+    function findVisibilityCycle($definition) {
+        // A field which has never been saved has no id, so nothing can point
+        // at it and no cycle is possible yet.
+        if (!($self = $this->getId()) || !($form = $this->getForm()))
+            return null;
+
+        $graph = array();
+        $fields = array();
+        foreach ($form->getDynamicFields() as $f) {
+            $id = $f->get('id');
+            $fields[$id] = $f;
+            // Whatever is stored for this field is replaced by $definition
+            if ($id == $self)
+                continue;
+            if ($stored = $f->getVisibilityDefinition())
+                $graph[$id] = FieldVisibilityConstraint::references($stored);
+        }
+
+        // Test each referenced field on its own, so the one reported back is
+        // the field the author actually chose. Reporting whichever node the
+        // search happened to close the loop on is useless advice -- for a
+        // mutual dependency that is this very field.
+        foreach (FieldVisibilityConstraint::references($definition) as $ref) {
+            $graph[$self] = array($ref);
+            if (FieldVisibilityConstraint::findCycle($graph, $self))
+                return isset($fields[$ref]) ? $fields[$ref] : null;
+        }
+
+        return null;
+    }
+
+    /**
+     * Sibling fields on this form which can be used as the condition in a
+     * visibility rule, as an array of array('field' => .., 'choices' => ..).
+     *
+     * The set is restricted by widget rather than by field type, because a
+     * rule is evaluated in the browser as well as on the server: the
+     * compiled expression reads the field through
+     * Widget::getJsValueGetter(), and only these report a value that a
+     * comparison can rely on. Rich text, uploads, date pickers and inline
+     * forms would each compare against something meaningless, so they are
+     * not offered.
+     *
+     * 'choices' is populated for fields which can enumerate their values, so
+     * the value side of a condition can be a picker rather than free text.
+     */
+    function getConditionCandidates() {
+        static $usable = array('ChoicesWidget', 'CheckboxWidget', 'TextboxWidget');
+
+        $candidates = array();
+        if (!($form = $this->getForm()))
+            return $candidates;
+
+        foreach ($form->getDynamicFields() as $f) {
+            // A field cannot condition itself
+            if ($this->getId() && $f->get('id') == $this->getId())
+                continue;
+            if (!$f->get('name'))
+                continue;
+
+            try {
+                $impl = $f->getImpl();
+                $widget = $impl->getWidget();
+            }
+            catch (Exception $e) {
+                // No widget; nothing the browser could read
+                continue;
+            }
+
+            $ok = false;
+            foreach ($usable as $class) {
+                if ($widget instanceof $class) { $ok = true; break; }
+            }
+            if (!$ok)
+                continue;
+
+            // Testing a field which already depends on this one, directly or
+            // through others, would make the rules circular. Leaving it out
+            // of the picker means the admin cannot build one by accident;
+            // ::setConfiguration() still rejects cycles arriving by other
+            // routes.
+            if ($this->findVisibilityCycle(array('terms' => array(
+                    array('field' => $f->get('id'), 'op' => 'eq', 'value' => '')))))
+                continue;
+
+            $choices = null;
+            if (method_exists($impl, 'getChoices')) {
+                try { $choices = $impl->getChoices(); }
+                catch (Exception $e) { $choices = null; }
+            }
+            if ($widget instanceof CheckboxWidget)
+                // The browser reads a checkbox with .is(':checked')
+                $choices = array('1' => __('Checked'), '' => __('Unchecked'));
+
+            $candidates[] = array(
+                'field' => $f,
+                'choices' => is_array($choices) ? $choices : null,
+            );
+        }
+
+        return $candidates;
+    }
+
+    /**
+     * Errors raised against a submitted visibility rule, for the condition
+     * builder to render.
+     */
+    function getVisibilityErrors() {
+        return $this->_visibilityErrors;
+    }
+
+    /**
+     * The stored visibility definition for this field, or null.
+     */
+    function getVisibilityDefinition() {
+        $config = isset($this->ht['configuration'])
+            ? $this->ht['configuration'] : null;
+        if (is_string($config))
+            $config = JsonDataParser::parse($config);
+        if (!is_array($config) || empty($config['visibility']))
+            return null;
+
+        return $config['visibility'];
     }
 
     function isDeletable() {
@@ -1255,12 +1457,30 @@ class DynamicFormEntry extends VerySimpleModel {
         return $this->getForm()->render($options);
     }
 
-    function getChanges() {
+    /**
+     * $discard must match what will be passed to ::saveAnswers(), so the
+     * recorded change agrees with what is stored. A conditionally hidden
+     * field is submitted with a value but saved as empty, and callers build
+     * this list before saving; without this the thread would report the
+     * submitted value for an answer which was actually cleared.
+     */
+    function getChanges($discard=false) {
         $fields = array();
+        $discardable = $discard
+            ? $this->getDiscardableAnswers($discard == 'create') : array();
         foreach ($this->getAnswers() as $a) {
             $field = $a->getField();
             if (!$field->hasData() || $field->isPresentationOnly())
                 continue;
+            if (isset($discardable[$field->get('id')])) {
+                // Report the clearing rather than the submitted value, so
+                // the old content is preserved in the thread.
+                $old = $a->getValue();
+                if ($old !== null && $old !== '')
+                    $fields[$field->get('id')] = array(
+                        $field->to_database($old), null);
+                continue;
+            }
             $changes = $field->getChanges();
             if (!$changes)
                 continue;
@@ -1312,8 +1532,98 @@ class DynamicFormEntry extends VerySimpleModel {
      *
      */
 
-    function save($refetch=false) {
-        return $this->saveAnswers(null, $refetch);
+    function save($refetch=false, $discard=false) {
+        return $this->saveAnswers(null, $refetch, $discard);
+    }
+
+    /**
+     * Whether this save should clear the answer of a conditionally hidden
+     * field.
+     *
+     * A hidden field's input is still present in the page -- the rule only
+     * slides it out of view -- so the browser submits its value regardless.
+     * Stored, that value contradicts the rule which says the question does
+     * not apply, and it was never validated, because ::getClean() skips
+     * validation while a field is hidden. It is also invisible to agents,
+     * since the same check governs rendering, while remaining present in
+     * exports, search and the API.
+     *
+     * $onCreate separates the two cases:
+     *
+     *  - Creating an entry, every conditionally hidden field is cleared.
+     *    There is no earlier data to lose.
+     *
+     *  - Updating one, only fields which this submission made inapplicable
+     *    are cleared, recognised by one of the fields their rule tests
+     *    having been changed by the same submission. A field which was
+     *    already hidden beforehand is left alone, so adding a rule to a
+     *    form does not erase the answer from every existing entry as it is
+     *    next touched for unrelated reasons.
+     *
+     * Only admin-configured rules qualify. The constraints declared in core
+     * against built-in fields express something else entirely and their
+     * data is not in question.
+     */
+    function getDiscardableAnswers($onCreate=false) {
+        $discard = array();
+
+        // Without a source there is nothing to evaluate the rules against:
+        // every field a rule tests would read as empty, so every
+        // conditional field would look hidden and have its answer cleared.
+        // Some callers populate an entry with ::setAnswer() instead, which
+        // never sets one. Refuse rather than act on values which were never
+        // submitted -- this makes opting in at a call site which turns out
+        // not to carry a form harmless instead of destructive.
+        if (!$this->getSource())
+            return $discard;
+
+        // Conditionally hidden for what is being submitted
+        foreach ($this->getAnswers() as $a) {
+            $field = $a->getField();
+            if (!(($field->get('visibility')) instanceof FieldVisibilityConstraint))
+                continue;
+            if ($field->isVisible())
+                continue;
+            $discard[$field->get('id')] = true;
+        }
+
+        if ($onCreate || !$discard)
+            return $discard;
+
+        // On an edit, keep only those which this submission made
+        // inapplicable. Evaluating the same rules against the answers
+        // already stored says which were visible beforehand; one that was
+        // hidden then is left alone, so introducing a rule does not erase
+        // answers from entries which merely get touched afterwards.
+        $form = $this->getForm();
+        $submitted = $form->getSource();
+
+        $prior = array();
+        foreach ($this->getAnswers() as $a)
+            $prior[$a->getField()->getFormName()] = $a->getValue();
+
+        $form->setSource($prior);
+        foreach ($this->getAnswers() as $a)
+            $a->getField()->reset();
+
+        foreach (array_keys($discard) as $id) {
+            foreach ($this->getAnswers() as $a) {
+                $field = $a->getField();
+                if ($field->get('id') != $id)
+                    continue;
+                // Already hidden before this edit; not this edit's doing
+                if ($field->isVisible() !== true)
+                    unset($discard[$id]);
+            }
+        }
+
+        // Put the submitted values back and drop everything derived from
+        // the prior ones, or the save which follows would write those.
+        $form->setSource($submitted);
+        foreach ($this->getAnswers() as $a)
+            $a->getField()->reset();
+
+        return $discard;
     }
 
     /**
@@ -1324,12 +1634,24 @@ class DynamicFormEntry extends VerySimpleModel {
      * which were save is returned (which may be ZERO).
      */
 
-    function saveAnswers($isEditable=null, $refetch=false) {
+    /**
+     * $discard opts this save into clearing conditionally hidden answers:
+     * false to leave them alone, 'create' or 'edit' to select the rule
+     * described on ::shouldDiscardAnswer(). It is off by default so that a
+     * programmatic save -- an API update which does not carry the form, a
+     * background job -- can never quietly erase an answer.
+     */
+    function saveAnswers($isEditable=null, $refetch=false, $discard=false) {
         if (count($this->dirty))
             $this->set('updated', new SqlFunction('NOW'));
 
         if (!parent::save($refetch || count($this->dirty)))
             return false;
+
+        // Computed once, before the loop: deciding this per answer would
+        // mean swapping the form's source in and out mid-save.
+        $discardable = $discard
+            ? $this->getDiscardableAnswers($discard == 'create') : array();
 
         $dirty = 0;
         foreach ($this->getAnswers() as $a) {
@@ -1345,6 +1667,18 @@ class DynamicFormEntry extends VerySimpleModel {
             // Set the entry here so that $field->getClean() can use the
             // entry-id if necessary
             $a->entry = $this;
+
+            // Clearing has to happen here rather than before the loop:
+            // ::getClean() reads the submitted source, so an answer emptied
+            // beforehand would simply be written back from the request.
+            if (isset($discardable[$field->get('id')])) {
+                $a->set('value', null);
+                $a->set('value_id', null);
+                if ($a->dirty)
+                    $dirty++;
+                $a->save($refetch);
+                continue;
+            }
 
             try {
                 $field->setForm($this);

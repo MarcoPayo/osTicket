@@ -187,7 +187,9 @@ implements TemplateVariable, Searchable {
         $entry = $this->addForm(OrganizationForm::objects()->one(), 1, $data);
         // FIXME: For some reason, the second save here is required or the
         //        custom data is not properly saved
-        $entry->save();
+        // Since this save is the one which actually persists the answers,
+        // it has to apply the same discard as the one inside ::addForm().
+        $entry->save(false, 'create');
 
         return $entry;
     }
@@ -281,7 +283,13 @@ implements TemplateVariable, Searchable {
         $entry = $form->instanciate($sort, $data);
         $entry->set('object_type', 'O');
         $entry->set('object_id', $this->getId());
-        $entry->save();
+        // 'create' drops answers for conditionally hidden fields, which the
+        // browser submits regardless of the rule. Only creation is opted in
+        // for organizations: unlike tickets and tasks there is no event log
+        // for custom field values, so clearing one on an edit would leave no
+        // record of what it held. A call which passes no data has no source
+        // and is left alone by ::getDiscardableAnswers().
+        $entry->save(false, 'create');
         return $entry;
     }
 

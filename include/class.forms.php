@@ -601,6 +601,8 @@ class FormField {
     var $answer;
     var $parent;
     var $presentation_only = false;
+    // Re-entrancy guard for ::isVisible(); see the note there
+    var $_evaluating_visibility = false;
 
     static $types = array(
         /* @trans */ 'Basic Fields' => array(
@@ -781,7 +783,26 @@ class FormField {
      */
     function isVisible() {
         if ($this->get('visibility') instanceof VisibilityConstraint) {
-            return $this->get('visibility')->isVisible($this);
+            // Evaluating a constraint asks the fields it tests whether they
+            // are themselves visible, so a circular rule would recurse until
+            // the stack gave out. Rules configured through the admin
+            // interface are checked for cycles before they are stored, but
+            // one can still arrive by SQL or through the API, and a bad row
+            // must not be able to take down every page the form renders on.
+            //
+            // Breaking the loop optimistically matches what happens when a
+            // rule can no longer be evaluated: the field stays visible and
+            // keeps collecting data.
+            if ($this->_evaluating_visibility)
+                return true;
+
+            $this->_evaluating_visibility = true;
+            try {
+                return $this->get('visibility')->isVisible($this);
+            }
+            finally {
+                $this->_evaluating_visibility = false;
+            }
         }
         return true;
     }
@@ -5718,6 +5739,262 @@ class VisibilityConstraint {
         if ($Q->isNegated())
             $expression = '!'.$expression;
         return $expression;
+    }
+}
+
+/**
+ * A VisibilityConstraint built from an admin-configured definition stored
+ * against a DynamicFormField, rather than declared in PHP.
+ *
+ * Two things make this more than a plain VisibilityConstraint.
+ *
+ * Terms reference the *id* of the field they test, not its name. Field
+ * names are editable in the form builder, so a name captured at save time
+ * goes stale the moment somebody renames the field it points at. Ids do
+ * not move.
+ *
+ * The parent evaluates a Q keyed by field name, so those ids have to be
+ * translated back before it runs. That is deferred until the constraint is
+ * first used, because the mapping comes from the assembled form -- asking
+ * for it while the form is still building its field list would re-enter
+ * that construction. By the time ::isVisible() or ::emitJavascript() is
+ * called the form is complete, and every field carries both its id and its
+ * name, so the mapping costs no queries.
+ *
+ * Stored definition:
+ *
+ *   array(
+ *     'initial' => 'hidden'|'visible',   // state before any evaluation
+ *     'match'   => 'all'|'any',          // AND / OR across terms
+ *     'negated' => bool,
+ *     'terms'   => array(
+ *        array('field' => 24, 'op' => 'eq'|'neq', 'value' => 'yes'),
+ *        array('match' => 'any', 'terms' => array(...)),   // nested group
+ *     ),
+ *   )
+ */
+class FieldVisibilityConstraint extends VisibilityConstraint {
+
+    var $definition;
+    var $_resolved = false;
+
+    function __construct($definition) {
+        $this->definition = is_array($definition) ? $definition : array();
+        $initial = (isset($this->definition['initial'])
+                && $this->definition['initial'] == 'visible')
+            ? self::VISIBLE : self::HIDDEN;
+        // Start with an empty Q. ::resolve() replaces it once the form is
+        // available; until then the parent falls back to $initial.
+        parent::__construct(new Q(array()), $initial);
+    }
+
+    /**
+     * Translate the stored, id-keyed definition into the name-keyed Q the
+     * parent expects. Runs once.
+     */
+    function resolve($field) {
+        if ($this->_resolved)
+            return;
+        // Only latch once a form is actually available, so a premature call
+        // does not freeze an empty constraint in place.
+        if (!($form = $field->getForm()))
+            return;
+        $this->_resolved = true;
+
+        $names = array();
+        foreach ($form->getFields() as $f) {
+            if (($id = $f->get('id')) && ($name = $f->get('name')))
+                $names[$id] = $name;
+        }
+        $this->constraint = static::compileGroup($this->definition, $names);
+
+        // A rule which had terms but compiled to nothing can no longer be
+        // evaluated -- every field it referenced has been deleted. Fall open
+        // rather than back to $initial, which would make the field disappear
+        // from the form with no indication why and quietly stop collecting
+        // data. An inert rule is recoverable; missing data is not.
+        if (!$this->constraint->constraints
+                && !empty($this->definition['terms']))
+            $this->initial = self::VISIBLE;
+    }
+
+    /**
+     * Build a Q from one group of the stored definition.
+     *
+     * Terms naming a field which is not on this form are dropped, matching
+     * what ::compileQ() and ::compileQPhp() do with names they cannot
+     * resolve.
+     *
+     * Note that Q keys terms as "<name>__<op>", so two terms testing the
+     * same field with the same operator collapse into one. Use a pipe
+     * separated value ("one|two") to match any of several values instead.
+     */
+    static function compileGroup($group, $names) {
+        $constraints = array();
+        $terms = isset($group['terms']) && is_array($group['terms'])
+            ? $group['terms'] : array();
+
+        foreach ($terms as $term) {
+            if (!is_array($term))
+                continue;
+            // Nested group
+            if (isset($term['terms'])) {
+                $nested = static::compileGroup($term, $names);
+                if ($nested->constraints)
+                    $constraints[] = $nested;
+                continue;
+            }
+            if (!isset($term['field']) || !isset($names[$term['field']]))
+                continue;
+            $op = (isset($term['op']) && $term['op'] == 'neq') ? 'neq' : 'eq';
+            $constraints[$names[$term['field']].'__'.$op] =
+                isset($term['value']) ? $term['value'] : '';
+        }
+
+        $flags = 0;
+        if (isset($group['match']) && $group['match'] == 'any')
+            $flags |= Q::ANY;
+        if (!empty($group['negated']))
+            $flags |= Q::NEGATED;
+
+        return new Q($constraints, $flags);
+    }
+
+    function isVisible($field) {
+        $this->resolve($field);
+        return parent::isVisible($field);
+    }
+
+    function emitJavascript($field) {
+        $this->resolve($field);
+        return parent::emitJavascript($field);
+    }
+
+    /**
+     * The definition as stored, for round-tripping through the field
+     * configuration blob.
+     */
+    function toArray() {
+        return $this->definition;
+    }
+
+    /**
+     * Every field id a definition tests, including inside nested groups.
+     *
+     * This is the edge list for the dependency graph between fields, which
+     * is what makes circular rules detectable before they are stored.
+     */
+    static function references($definition, &$ids=array()) {
+        if (!is_array($definition))
+            return array();
+
+        $terms = isset($definition['terms']) && is_array($definition['terms'])
+            ? $definition['terms'] : array();
+
+        foreach ($terms as $term) {
+            if (!is_array($term))
+                continue;
+            if (isset($term['terms'])) {
+                static::references($term, $ids);
+                continue;
+            }
+            if (isset($term['field']) && ($id = (int) $term['field']))
+                $ids[$id] = true;
+        }
+
+        return array_keys($ids);
+    }
+
+    /**
+     * Depth-first search of a field dependency graph for a node reachable
+     * from $start which appears twice on one path -- that is, a cycle.
+     *
+     * $graph maps a field id to the ids its rule tests. Returns the id which
+     * closes the loop, or null when the graph is acyclic from $start.
+     *
+     * Any cycle reachable from $start counts, not only one closing back on
+     * $start: running into a loop anywhere downstream is enough to make the
+     * starting field's own rule unevaluable.
+     */
+    static function findCycle($graph, $start, $path=array(), &$done=array()) {
+        if (isset($path[$start]))
+            return $start;
+        if (isset($done[$start]))
+            return null;
+
+        $path[$start] = true;
+        $edges = isset($graph[$start]) ? $graph[$start] : array();
+        foreach ($edges as $next) {
+            if ($hit = static::findCycle($graph, $next, $path, $done))
+                return $hit;
+        }
+        $done[$start] = true;
+
+        return null;
+    }
+
+    /**
+     * Normalise a submitted definition into the shape which gets stored,
+     * discarding anything unrecognised. The request describes a structure,
+     * so none of it can be taken on trust.
+     *
+     * $self is the id of the field the rule belongs to, when known. A field
+     * cannot condition itself -- evaluating it would recurse through
+     * ::isVisible() forever -- so such terms are dropped.
+     *
+     * Returns null when nothing usable survives, which callers treat as
+     * "no rule".
+     */
+    static function normalize($input, $self=null, $depth=0) {
+        if (is_string($input))
+            $input = JsonDataParser::parse($input);
+        if (!is_array($input))
+            return null;
+
+        // A hand-built request could otherwise nest groups deeply enough to
+        // exhaust the stack when the definition is compiled.
+        if ($depth > 5)
+            return null;
+
+        $group = array(
+            'match' => (isset($input['match']) && $input['match'] == 'any')
+                ? 'any' : 'all',
+            'negated' => !empty($input['negated']),
+            'terms' => array(),
+        );
+        // Only the outermost group carries the pre-evaluation state.
+        if (!$depth)
+            $group['initial'] = (isset($input['initial'])
+                    && $input['initial'] == 'visible')
+                ? 'visible' : 'hidden';
+
+        $terms = isset($input['terms']) && is_array($input['terms'])
+            ? $input['terms'] : array();
+
+        foreach ($terms as $term) {
+            if (!is_array($term))
+                continue;
+
+            if (isset($term['terms'])) {
+                if ($nested = static::normalize($term, $self, $depth + 1))
+                    $group['terms'][] = $nested;
+                continue;
+            }
+
+            if (!isset($term['field']) || !($id = (int) $term['field']))
+                continue;
+            if ($self && $id == $self)
+                continue;
+
+            $group['terms'][] = array(
+                'field' => $id,
+                'op' => (isset($term['op']) && $term['op'] == 'neq')
+                    ? 'neq' : 'eq',
+                'value' => isset($term['value']) ? (string) $term['value'] : '',
+            );
+        }
+
+        return $group['terms'] ? $group : null;
     }
 }
 

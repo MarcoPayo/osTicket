@@ -59,10 +59,10 @@ if ($_POST && is_object($ticket) && $ticket->getId()) {
         }
         if (!$errors) {
             foreach ($forms as $form) {
-                $changes += $form->getChanges();
+                $changes += $form->getChanges('edit');
                 $form->saveAnswers(function ($f) {
                         return $f->isVisibleToUsers()
-                         && $f->isEditableToUsers(); });
+                         && $f->isEditableToUsers(); }, false, 'edit');
 
             }
             if ($changes) {

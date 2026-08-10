@@ -3769,7 +3769,7 @@ implements RestrictedAccess, Threadable, Searchable {
 
         // Update dynamic meta-data
         foreach ($forms as $form) {
-            if ($C = $form->getChanges())
+            if ($C = $form->getChanges('edit'))
                 $changes['fields'] = ($changes['fields'] ?: array()) + $C;
             // Drop deleted forms
             $idx = array_search($form->getId(), $vars['forms']);
@@ -3780,7 +3780,8 @@ implements RestrictedAccess, Threadable, Searchable {
                 $form->set('sort', $idx);
                 $form->saveAnswers(function($f) {
                         return $f->isVisibleToStaff()
-                        && $f->isEditableToStaff(); }
+                        && $f->isEditableToStaff(); },
+                        false, 'edit'
                         );
             }
         }
@@ -4389,12 +4390,15 @@ implements RestrictedAccess, Threadable, Searchable {
             $subject->setValue($topic->getFullName());
 
         $form->setTicketId($ticket->getId());
-        $form->save();
+        // 'create' discards every conditionally hidden answer: the browser
+        // submits hidden inputs regardless of the rule, and there is no
+        // earlier data here to protect.
+        $form->save(false, 'create');
 
         // Save the form data from the help-topic form, if any
         foreach ($topic_forms as $topic_form) {
             $topic_form->setTicketId($ticket->getId());
-            $topic_form->save();
+            $topic_form->save(false, 'create');
         }
 
         $ticket->loadDynamicData(true);
