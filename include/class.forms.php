@@ -5560,21 +5560,30 @@ class VisibilityConstraint {
         if (!$this->constraint->constraints)
             return;
 
+        if (!($form = $field->getForm()))
+            return;
+
+        // Compile before emitting anything. A constraint naming only fields
+        // which are not on this form compiles to an empty expression, which
+        // would be emitted as `if ()` and break the whole script block.
+        $expression = $this->compileQ($this->constraint, $form);
+        if (!$expression)
+            return;
+
         $func = 'recheck_'.$field->getWidget()->id;
-        $form = $field->getForm();
+        $target = $field->getWidget()->id;
+        $fields = $this->getAllFields($this->constraint);
 ?>
     <script type="text/javascript">
       !(function() {
         var <?php echo $func; ?> = function() {
-          var target = $('#field<?php echo $field->getWidget()->id; ?>');
-<?php   $fields = $this->getAllFields($this->constraint);
-        foreach ($fields as $f) {
-            if (!($field = $form->getField($f)))
+          var target = $('#field<?php echo $target; ?>');
+<?php   foreach ($fields as $f) {
+            if (!($F = $form->getField($f)))
                 continue;
             echo sprintf('var %1$s = x = $("#%1$s");',
-                $field->getWidget()->id);
+                $F->getWidget()->id);
         }
-        $expression = $this->compileQ($this->constraint, $form);
 ?>
           if (<?php echo $expression; ?>) {
             target.slideDown('fast', function (){
@@ -5588,9 +5597,9 @@ class VisibilityConstraint {
         };
 
 <?php   foreach ($fields as $f) {
-            if (!($field=$form->getField($f)))
+            if (!($F = $form->getField($f)))
                 continue;
-            $w = $field->getWidget();
+            $w = $F->getWidget();
 ?>
         $('#<?php echo $w->id; ?>').on('change', <?php echo $func; ?>);
         $('#field<?php echo $w->id; ?>').on('show hide', <?php
@@ -5633,16 +5642,24 @@ class VisibilityConstraint {
             }
             else {
                 @list($f, $op) = self::splitFieldAndOp($c);
-                $field = $form->getField($f);
-                $wval = $field ? $field->getClean() : null;
+                // Use a separate variable -- $field is the field being tested
+                // for visibility and is still needed by the nested-Q recursion
+                // above.
+                //
+                // Skip constraints naming a field which is not on the form.
+                // ::compileQ() does the same, so the expression evaluated in
+                // the browser and the one evaluated here stay in agreement.
+                if (!($F = $form->getField($f)))
+                    continue;
+                $wval = $F->getClean();
                 $values = explode('|', $value);
                 switch ($op) {
                 case 'neq':
-                    $expr[] = ($wval && !in_array($wval, $values) && $field->isVisible());
+                    $expr[] = ($wval && !in_array($wval, $values) && $F->isVisible());
                     break;
                 case 'eq':
                 case null:
-                    $expr[] = (in_array($wval, $values) && $field->isVisible());
+                    $expr[] = (in_array($wval, $values) && $F->isVisible());
                 }
             }
         }
@@ -5651,15 +5668,17 @@ class VisibilityConstraint {
             : function($a, $b) { return $a && $b; };
         $initial = !$Q->isOred();
         $expression = array_reduce($expr, $glue, $initial);
-        if ($Q->isNegated)
+        if ($Q->isNegated())
             $expression = !$expression;
         return $expression;
     }
 
     function getAllFields(Q $Q, &$fields=array()) {
         foreach ($Q->constraints as $c=>$value) {
-            if ($c instanceof Q) {
-                $this->getAllFields($c, $fields);
+            // Nested groups are stored as the value, not the key -- compare
+            // ::compileQPhp() and ::compileQ(), which both test $value.
+            if ($value instanceof Q) {
+                $this->getAllFields($value, $fields);
             }
             else {
                 @list($f) = self::splitFieldAndOp($c);
@@ -5696,7 +5715,7 @@ class VisibilityConstraint {
         $expression = implode($glue, $expr);
         if (count($expr) > 1)
             $expression = '('.$expression.')';
-        if ($Q->isNegated)
+        if ($Q->isNegated())
             $expression = '!'.$expression;
         return $expression;
     }
